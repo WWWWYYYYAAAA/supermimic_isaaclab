@@ -1,0 +1,33 @@
+# Python, build and tool caches
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+# Local editor and environment files
+.idea/
+.vscode/
+.env
+.env.*
+# Pinned upstream source; installed by tools/setup.sh
+IsaacLab/
+# Downloaded third-party data and generated assets
+data/
+# Local training/evaluation artifacts
+logs/
+exports/
+results/
+*.pt
+*.pth
+*.ts
+*.onnx
+*.npz
+*.mp4
+*.gif
+*.pdf
+*.log
