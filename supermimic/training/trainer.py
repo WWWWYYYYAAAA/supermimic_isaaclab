@@ -218,10 +218,27 @@ class Trainer:
         return (cat(starts), cat(hists))
 
     def policy_update(self):
+        first_update = not getattr(self, "_policy_update_started", False)
+        self._policy_update_started = True
+        phase_start = time.perf_counter()
+
+        def phase_finished(name):
+            nonlocal phase_start
+            if first_update:
+                if torch.device(self.dev).type == "cuda":
+                    torch.cuda.synchronize(self.dev)
+                now = time.perf_counter()
+                print(f"[first actor/critic update] {name}: {now-phase_start:.2f}s", flush=True)
+                phase_start = now
+
+        if first_update:
+            print("[first actor/critic update] Starting sampling, imagination and BPTT; "
+                  "torch.compile may spend time compiling CUDA kernels on first use.", flush=True)
         if self.PROFILE:
             torch.cuda.synchronize()
             tq0 = time.time()
         (s, h) = self.sample_valid_starts(self.args.pi_batch)
+        phase_finished("replay sampling")
         S = unflatten_state(s["s"])
         (xi, f, a_prev) = (s["xi"], s["f"], s["a_prev"])
         xi_n = normalize_xi(xi)
@@ -234,6 +251,7 @@ class Trainer:
         g0 = self.mdp.goal(S, f, self.K, self.anchor_obs, noise=True)
         g = g0
         S0 = S
+        phase_finished("initial observations and anchor goal")
         (Ss, As, Aps, Fs, Gs) = ([], [], [], [], [])
         for t in range(self.HZ):
             Aps.append(a_prev)
@@ -241,6 +259,9 @@ class Trainer:
                 S, o_hist, a_prev, f, xi, xi_n, g
             )
             (Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g))
+            if first_update and t in (0, 1):
+                phase_finished(f"imagination step {t+1} (first-use compilation included)")
+        phase_finished("remaining imagination rollout")
         flat = lambda xs: torch.stack(xs).flatten(0, 1)
         S_all = tuple((flat([St[i] for St in Ss]) for i in range(6)))
         f_all = flat(Fs)
@@ -260,11 +281,13 @@ class Trainer:
                 self._critic_input(S, f, xi_n, g)
             )
         loss = -J.mean()
+        phase_finished("reward, termination and value forward")
         if self.PROFILE:
             torch.cuda.synchronize()
             tq1 = time.time()
         self.opt_pi.zero_grad(set_to_none=True)
         loss.backward()
+        phase_finished("actor backward (first-use compilation included)")
         if self.PROFILE:
             torch.cuda.synchronize()
             tq2 = time.time()
@@ -316,6 +339,7 @@ class Trainer:
                     v_loss.backward()
                     nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
                     self.opt_v.step()
+        phase_finished("optimizer and critic updates")
         if self.PROFILE:
             torch.cuda.synchronize()
             print(
@@ -404,7 +428,7 @@ class Trainer:
             step_acc += 1.0 / self.args.utd
             n = int(step_acc)
             step_acc -= n
-            prof = self.PROFILE and it % 20 == 0 and (it > self.args.wm_only_iters + 5)
+            prof = self.PROFILE and it % 20 == 0 and (it >= self.args.wm_only_iters)
             if prof:
                 torch.cuda.synchronize()
                 tp0 = time.time()
@@ -480,6 +504,7 @@ class Trainer:
             save_ckpt = (it + 1) % self.args.ckpt_every == 0 or final_iteration
             save_last = (it + 1) % self.args.last_every == 0 or final_iteration
             if save_ckpt or save_last:
+                checkpoint_start = time.perf_counter()
                 ck = {
                     "wm": self.wm.state_dict(),
                     "pi": self.pi.state_dict(),
@@ -519,4 +544,8 @@ class Trainer:
                     path = os.path.join(self.args.log_dir, f"ckpt_{it + 1:06d}.pt")
                     torch.save(small, path + ".tmp")
                     os.replace(path + ".tmp", path)
+                if self.PROFILE:
+                    print(f"[prof] checkpoint it {it+1}: "
+                          f"{1000*(time.perf_counter()-checkpoint_start):.0f} ms "
+                          f"(last={save_last}, numbered={save_ckpt})", flush=True)
         log_f.close()

@@ -97,6 +97,10 @@ docker exec supermimic_isaaclab python supermimic/train.py --help
 
 Defaults use 4096 environments, a replay capacity of 1000 steps per environment, and 4096 imagined starting states, which require more GPU memory than this example. The first run compiles `torch.compile` kernels. Changing batch sizes changes the training conditions, so convergence times from different configurations are not directly comparable.
 
+By default, the first 500 iterations train only the world model. Iteration 501 first executes actor/critic imagination and backpropagation and can trigger another CUDA compilation. The first policy update now reports phase timings. Prefix a training command with `SM_PROFILE=1` to time collection, world-model updates, imagined forward/backward passes, critic updates and checkpoint writes. Profiling synchronizes the GPU; disable it when measuring normal throughput. Full `last.pt` checkpoints default to every 200 iterations and numbered checkpoints to every 2000 iterations.
+
+The torso anchor computes only the root-to-torso joint chain, preserving the original observations and gradients while avoiding unused limb poses and velocities.
+
 Log directories receive an Asia/Shanghai (UTC+8) timestamp by default, for example `logs/lafan1_YYYYMMDD_HHMMSS_ffffff`. The actual directory is printed in the terminal. `--no-timestamp` uses the exact supplied path and requires it to be absent or empty. Use the **actual run directory** for evaluation, playback, and export.
 
 | Output | Contents |

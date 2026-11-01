@@ -106,6 +106,7 @@ class MDP:
         self.legacy_inputs = False
         self.motion.default_q = default_q
         self.anchor_index = [kin.body_names[i] for i in kin.tracked_idx].index("torso_link")
+        self.anchor_body_index = kin.tracked_idx[self.anchor_index]
         self.max_step_reward = cfg.max_reward_rate * CONTROL_DT
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
@@ -244,10 +245,10 @@ class MDP:
 
     def anchor_observation(self, S, f):
         """Reference torso pose in the current robot torso frame (3+6)."""
-        bp, bR, _, _ = self.kin.forward(*S)
+        p, R = self.kin.body_pose(S[0], S[1], S[4], self.anchor_body_index)
         i = self.anchor_index
-        Rt = bR[..., i, :, :].transpose(-1, -2)
-        dp = (Rt @ (self.motion.body_p[f][..., i, :]-bp[..., i, :]).unsqueeze(-1)).squeeze(-1)
+        Rt = R.transpose(-1, -2)
+        dp = (Rt @ (self.motion.body_p[f][..., i, :]-p).unsqueeze(-1)).squeeze(-1)
         ori = mat_to_6d(Rt @ self.motion.body_R[f][..., i, :, :])
         return torch.cat((dp, ori), -1)
 

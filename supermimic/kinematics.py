@@ -59,6 +59,15 @@ class G1Kinematics:
         )
         self.tracked_idx = [bodies.index(n) for n in tracked]
         self.num_bodies = len(bodies)
+        # Static ancestor paths allow pose-only queries without full-body FK.
+        chains = []
+        for body in range(self.num_bodies):
+            chain = []
+            while self.parent[body] >= 0:
+                chain.append(body)
+                body = self.parent[body]
+            chains.append(tuple(reversed(chain)))
+        self.body_chains = tuple(chains)
         # joint limits (in G1_JOINT_NAMES order)
         lo, hi = np.zeros(29), np.zeros(29)
         for j in range(m.njnt):
@@ -67,6 +76,17 @@ class G1Kinematics:
                 lo[jname_to_idx[n]], hi[jname_to_idx[n]] = m.jnt_range[j]
         self.q_lo = torch.tensor(lo, dtype=torch.float32, device=device)
         self.q_hi = torch.tensor(hi, dtype=torch.float32, device=device)
+
+    def body_pose(self, p, R, q, body_index: int):
+        """Differentiable pose of one body, evaluating only its ancestor joints.
+
+        No limb poses or velocities are needed for the torso anchor. Keep exactly
+        the same transform order as forward() so values and derivatives agree.
+        """
+        for i in self.body_chains[body_index]:
+            p = p + (R @ self.off_p[i].unsqueeze(-1)).squeeze(-1)
+            R = (R @ self.off_R[i]) @ axis_angle_to_mat(self.axes[i], q[..., self.joint_idx[i]])
+        return p, R
 
     def forward(self, p, R, v, w, q, qd, all_bodies: bool = False):
         """Tracked-body world positions, rotations, linear (link-origin) and angular velocities.
