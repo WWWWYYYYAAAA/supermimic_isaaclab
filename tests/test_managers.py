@@ -80,7 +80,7 @@ class ManagerLifecycleTest(unittest.TestCase):
 
     def test_failure_and_clip_end_stay_distinct_in_evaluation(self):
         env = manager_env(self.motion, self.mdp, eval_mode=True)
-        frames = torch.tensor([3, int(self.motion.clip_end[1]) - 1])
+        frames = torch.tensor([3, int(self.motion.tracking_end(env.reference.cfg.goal_frames)[1]) - 1])
         env.reset_reference(torch.arange(2), frames)
         env.scene["robot"].force_failure = True
         _, _, term, timeout, extras = env.step(torch.zeros(2, 29))

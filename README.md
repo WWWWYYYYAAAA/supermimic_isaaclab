@@ -1,5 +1,7 @@
 # SuperMimic Isaac Lab
 
+Current network contract: [v7 inputs, normalization, motion goals and termination](NETWORK_INPUTS.md).
+
 This repository is a refactoring of [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed.git), built around Isaac Lab's **manager-based environment, `ManagerBasedRLEnv`**. It is an **unofficial reproduction** of [*SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*](https://arxiv.org/abs/2610.28480).
 
 The project focuses on tracking LAFAN1 reference motions with the 29-DoF Unitree G1. It retains SuperMimic's learning loop: simulator collection → world-model fitting from replay → policy updates through imagined rollouts with BPTT → critic updates. Isaac Lab Managers organize the environment, with Newton / MuJoCo-Warp providing kit-less physics. The trainer does not use PPO.
@@ -184,12 +186,13 @@ import torch
 
 policy = torch.jit.load("path/to/export/policy_ckpt_002000.pt", map_location="cpu").eval()
 # obs_history: float32 [B, 10, 93], oldest frame first, built and scaled per task config
-# motion_goal: float32 [B, 730], following MotionLib.goal's reference feature layout
+# motion_goal: float32 [B, 689], MDP.goal reference window plus torso anchor
 with torch.no_grad():
-    actions = policy(obs_history.flatten(start_dim=1), motion_goal)  # [B, 29]
+    obs_flat = torch.cat([part.flatten(1) for part in obs_history.split((29,29,3,3,29), -1)], -1)
+    actions = policy(obs_flat, motion_goal)  # [B, 29]
 ```
 
-The encoder maps a `[B, 730]` goal to a `[B, 32]` latent. Call the decoder as `decoder(obs_flat, latent)`, with `[B, 930]` observation history and the latent. All inputs must be `float32`. The full policy includes observation and goal normalization and produces normalized actions. An external controller must construct PD targets using the default joint positions, nominal offsets, and action scales in the metadata. Exports do not contain the motion library, simulator, or hardware communication.
+The encoder maps a `[B, 689]` goal to a `[B, 32]` latent. Call the decoder as `decoder(obs_flat, latent)`, with `[B, 930]` observation history and the latent. All inputs must be `float32`. The full policy includes observation and goal normalization and produces normalized actions. An external controller must construct PD targets using the default joint positions, nominal offsets, and action scales in the metadata. Exports do not contain the motion library, simulator, or hardware communication.
 
 ## Configuration and validation
 
@@ -208,13 +211,13 @@ docker exec supermimic_isaaclab python tools/test_env.py --num_envs 8
 
 Validation performed during this refactoring:
 
-- **59/59 CPU unit tests** and **3 motion-goal tests** passed. These cover configuration propagation, learning updates, evaluation, input contracts, and export, using real Isaac Lab Managers with a deterministic CPU physics substitute where applicable.
+- Historical pre-v7 validation: **59/59 CPU unit tests** and **3 motion-goal tests** passed. See NETWORK_INPUTS.md for the new contracts and rerun the suite for current validation. These cover configuration propagation, learning updates, evaluation, input contracts, and export, using real Isaac Lab Managers with a deterministic CPU physics substitute where applicable.
 - The repository independence check passed, including local source paths and asset dependencies.
 - A real GPU smoke test completed training and checkpoint saving with **2 environments and 2 iterations**, using a short LAFAN1 excerpt of **300 source frames** with **`torch.compile` disabled**. All three TorchScript components exported successfully; checkpoint evaluation, trajectory recording, and **20 steps of headless playback** also completed.
 
 These checks do not establish full training convergence or reproduction of the paper's performance. A fresh Docker installation has not been validated end to end.
 
-The current actor uses 93 values per frame and BatchNorm statistics; world-model and critic input semantics are identified by `model_input_version=2`. Playback or export compatibility with older weights depends on saved configuration and normalization keys, not just matching tensor dimensions.
+Current networks use EmpiricalNormalization and `model_input_version=7`. Actor history is term-major; the default goal is 689D and critic input is 797D. See [NETWORK_INPUTS.md](NETWORK_INPUTS.md) for exact features, integration, termination options, and legacy inference compatibility.
 
 ## Attribution and licenses
 

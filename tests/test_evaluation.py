@@ -54,8 +54,9 @@ class EvaluationTest(unittest.TestCase):
         adapter = TrackingSim.__new__(TrackingSim)
         adapter.env = manager_env(motion, mdp, eval_mode=True)
         ck = {
+            "model_input_version": 7,
             "args": {"goal_frames": 2, "hist": 2, "amp": "none"},
-            "pi": Policy(OBS_DIM, 146, hist=2).state_dict(),
+            "pi": Policy(OBS_DIM, 145, hist=2).state_dict(),
             "wall_time": 3600.0,
             "saved_at": "2026-10-29 12:00:00",
             "iteration": 2000,
@@ -66,6 +67,9 @@ class EvaluationTest(unittest.TestCase):
             self.assertTrue(np.isfinite(result["norm_return"]))
             self.assertEqual(set(result["per_clip"]), set(motion.names))
             with np.load(root / "trajectory.npz") as trajectory:
+                np.testing.assert_array_equal(trajectory["alive"].sum(axis=0), (motion.clip_len-2).numpy())
+                self.assertEqual(result["goal_frames"], 2)
+                self.assertEqual(result["clip_end_rule"], "current_frame + goal_frames - 1 >= last_reference_frame")
                 self.assertEqual(
                     set(trajectory.files),
                     {
@@ -75,6 +79,7 @@ class EvaluationTest(unittest.TestCase):
                         "q",
                         "f",
                         "alive",
+                        "state", "motion_goal", "obs_history", "xi", "action",
                         "ref_root_p",
                         "ref_root_R",
                         "ref_q",

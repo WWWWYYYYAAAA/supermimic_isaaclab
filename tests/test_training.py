@@ -32,6 +32,7 @@ class TrainingTest(unittest.TestCase):
             trainer.opt_wm = trainer.opt_pi = trainer.opt_v = Mock(param_groups=[])
             trainer.opt_wm.state_dict.return_value = {}
             trainer.collect = Mock()
+            trainer.last_term_bce = torch.tensor(0.)
             trainer.wm_update = Mock(return_value=(0.0, 0.0))
             trainer.lr_at = Mock(return_value=0.001)
             saved = []
@@ -52,6 +53,36 @@ class TrainingTest(unittest.TestCase):
                 ["ckpt_002000.pt.tmp", "ckpt_002001.pt.tmp"],
             )
             self.assertEqual(torch.load(Path(tmp) / "last.pt")["iteration"], 2001)
+
+    def test_analytic_termination_without_anchor_runs_full_learning_step(self):
+        torch.set_num_threads(2)
+        kin, motion, mdp = make_motion()
+        with tempfile.TemporaryDirectory() as tmp:
+            args = train_parser(False).parse_args([
+                "--num_envs", "2", "--iterations", "1", "--buffer_steps", "16",
+                "--hist", "2", "--goal_frames", "2", "--horizon", "2",
+                "--wm_window", "2", "--wm_batches", "1", "--wm_batch", "2", "--pi_batch", "2",
+                "--warmup_steps", "4", "--wm_only_iters", "0", "--critic_epochs", "1",
+                "--critic_minibatches", "1", "--amp", "none", "--log_dir", tmp,
+                "--no-anchor_obs", "--termination_head", "analytic"])
+            with (patch("supermimic.training.trainer.G1Kinematics", return_value=kin),
+                  patch("supermimic.training.trainer.MotionLib.from_dir", return_value=motion),
+                  patch("supermimic.training.trainer.WorldModel", side_effect=lambda **kw: WorldModel(hidden=(16,16), **kw)),
+                  patch("torch.compile", side_effect=lambda fn: fn)):
+                learner = Trainer(args, device="cpu")
+            from supermimic.env import TrackingSim
+            adapter = TrackingSim.__new__(TrackingSim)
+            adapter.env = manager_env(motion, mdp, reset_noise=False)
+            learner.run(adapter)
+            self.assertEqual(learner.GOAL_DIM, 136)
+            self.assertEqual(learner.CRITIC_IN, 244)
+            self.assertIsNone(learner.wm.term_head)
+            self.assertEqual(learner.last_term_bce.item(), 0.)
+            self.assertTrue(all(torch.isfinite(p).all() for p in learner.pi.parameters()))
+            saved = torch.load(Path(tmp)/"last.pt", weights_only=True)
+            self.assertEqual(saved["model_input_version"], 7)
+            self.assertFalse(saved["args"]["anchor_obs"])
+            self.assertFalse(any(k.startswith("term_head.") for k in saved["wm"]))
 
     def test_world_model_bptt_and_checkpoint_contract(self):
         torch.set_num_threads(2)
@@ -103,7 +134,7 @@ class TrainingTest(unittest.TestCase):
                 ),
                 patch(
                     "supermimic.training.trainer.WorldModel",
-                    side_effect=lambda: WorldModel(hidden=(16, 16)),
+                    side_effect=lambda **kw: WorldModel(hidden=(16, 16), **kw),
                 ),
                 patch("torch.compile", side_effect=lambda fn: fn),
             ):

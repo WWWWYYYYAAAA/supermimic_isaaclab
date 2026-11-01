@@ -25,7 +25,8 @@ if __package__ in (None, ""):
 import torch
 from torch import nn
 
-from supermimic.normalization import FeatureBatchNorm
+from supermimic.normalization import FeatureBatchNorm, EmpiricalNormalization
+from supermimic.motion import LEGACY_GOAL_FRAME_DIM as GOAL_FRAME_DIM, checkpoint_goal_dim
 from supermimic.robot_spec import G1_JOINT_NAMES, default_joint_pos_list
 from supermimic.tasks.tracking.control_cfg import PDControlCfg, joint_pd_parameters
 from supermimic.tasks.tracking.observation_cfg import ObservationCfg, SensorTermCfg
@@ -44,6 +45,14 @@ def _batch_norm_from_state(state: dict, prefix: str, history: int = 1) -> Featur
     return norm.eval()
 
 
+def _normalizer_from_state(state, prefix, history=1):
+    if f"{prefix}._mean" not in state:
+        return _batch_norm_from_state(state, prefix, history)
+    norm = EmpiricalNormalization(state[f"{prefix}._mean"].shape[-1])
+    norm.load_state_dict({name: state[f"{prefix}.{name}"].detach().cpu() for name in norm.state_dict()})
+    return norm.eval()
+
+
 def _mlp_from_state(state: dict, prefix: str) -> nn.Sequential:
     indices = sorted(
         int(match.group(1))
@@ -51,7 +60,7 @@ def _mlp_from_state(state: dict, prefix: str) -> nn.Sequential:
         if (match := re.fullmatch(re.escape(prefix) + r"\.(\d+)\.weight", key))
     )
     if not indices or indices != list(range(0, len(indices) * 2, 2)):
-        raise ValueError(f"Unsupported {prefix} layout: expected Linear/ELU MLP")
+        raise ValueError(f"Unsupported {prefix} layout: expected alternating Linear/activation MLP")
     layers = []
     previous_width = None
     for position, index in enumerate(indices):
@@ -67,7 +76,7 @@ def _mlp_from_state(state: dict, prefix: str) -> nn.Sequential:
             layer.bias.copy_(bias)
         layers.append(layer)
         if position != len(indices) - 1:
-            layers.append(nn.ELU())
+            layers.append(nn.SiLU() if "goal_norm._mean" in state else nn.ELU())
         previous_width = weight.shape[0]
     return nn.Sequential(*layers)
 
@@ -81,8 +90,8 @@ class ExportedPolicy(nn.Module):
         super().__init__()
         self.check_inputs = False
         self.history, self.obs_dim, self.goal_dim = history, obs_dim, goal_dim
-        self.obs_norm = _batch_norm_from_state(state, "obs_norm", history)
-        self.goal_norm = _batch_norm_from_state(state, "goal_norm")
+        self.obs_norm = _normalizer_from_state(state, "obs_norm", history)
+        self.goal_norm = _normalizer_from_state(state, "goal_norm")
         self.enc = _mlp_from_state(state, "enc")
         self.dec = _mlp_from_state(state, "dec")
         if self.enc[0].in_features != goal_dim:
@@ -91,14 +100,8 @@ class ExportedPolicy(nn.Module):
             raise ValueError("Observation history width does not match decoder")
         if self.dec[-1].out_features != len(G1_JOINT_NAMES):
             raise ValueError("Expected 29 normalized G1 joint actions")
-        expected = {
-            "obs_norm.running_mean",
-            "obs_norm.running_var",
-            "obs_norm.num_batches_tracked",
-            "goal_norm.running_mean",
-            "goal_norm.running_var",
-            "goal_norm.num_batches_tracked",
-        }
+        expected = {f"{prefix}.{name}" for prefix, norm in
+                    (("obs_norm", self.obs_norm), ("goal_norm", self.goal_norm)) for name in norm.state_dict()}
         for prefix, model in (("enc", self.enc), ("dec", self.dec)):
             expected.update(f"{prefix}.{name}" for name in model.state_dict())
         if set(state) != expected:
@@ -198,12 +201,17 @@ def _observations_from_saved(values):
     return config
 
 
-def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
+def load_export_inputs(
+    checkpoint_path: Path, task: str = "g1", *, checkpoint_data: dict | None = None
+):
     """Read a checkpoint and its portable semantics without loading simulator code."""
-    if task != "g1":
-        raise ValueError("task must be g1")
+    if task not in ("volleyball", "g1"):
+        raise ValueError("task must be volleyball or g1")
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    checkpoint = (
+        torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if checkpoint_data is None else checkpoint_data
+    )
     if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("pi"), dict):
         raise ValueError(
             "Expected a SuperMimic training checkpoint containing pi and args"
@@ -216,27 +224,27 @@ def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
     state = checkpoint["pi"]
     if "obs_norm.mean" in state or "goal_norm.mean" in state:
         raise ValueError(
-            "Legacy RunningNorm checkpoint: retrain with the BatchNorm policy before exporting"
+            "Legacy RunningNorm checkpoint is unsupported by this exporter; use its matching exporter or train a v7 policy"
         )
-    for key in (
-        "obs_norm.running_mean", "obs_norm.running_var",
-        "goal_norm.running_mean", "goal_norm.running_var",
-    ):
-        value = state.get(key)
-        if not isinstance(value, torch.Tensor) or value.ndim != 1:
-            raise ValueError(f"Invalid or missing {key}")
+    empirical = checkpoint.get("model_input_version", 0) >= 7
+    mean_key, var_key = ("_mean", "_var") if empirical else ("running_mean", "running_var")
+    for prefix in ("obs_norm", "goal_norm"):
+        mean, var = state.get(f"{prefix}.{mean_key}"), state.get(f"{prefix}.{var_key}")
+        if not isinstance(mean, torch.Tensor) or mean.ndim != (2 if empirical else 1):
+            raise ValueError(f"Invalid or missing {prefix}.{mean_key}")
+        if not isinstance(var, torch.Tensor) or var.shape != mean.shape or (var < 0).any():
+            raise ValueError(f"Invalid {prefix} variance")
     for key, value in state.items():
         if not isinstance(value, torch.Tensor) or not torch.isfinite(value).all():
             raise ValueError(f"Policy tensor is missing or nonfinite: {key}")
-    for prefix in ("obs_norm", "goal_norm"):
-        if (
-            state[f"{prefix}.running_var"].shape != state[f"{prefix}.running_mean"].shape
-            or (state[f"{prefix}.running_var"] < 0).any()
-        ):
-            raise ValueError(f"Invalid {prefix} variance")
-    obs_dim = state["obs_norm.running_mean"].numel()
-    goal_dim = 73 * goal_frames
-    if state["goal_norm.running_mean"].numel() != goal_dim:
+    obs_width = state[f"obs_norm.{mean_key}"].numel()
+    if empirical and obs_width % history:
+        raise ValueError("Observation normalizer width must be divisible by history")
+    obs_dim = obs_width // history if empirical else obs_width
+    goal_dim = checkpoint_goal_dim(checkpoint)
+    orientation_frames = 0 if empirical else (goal_dim - GOAL_FRAME_DIM * goal_frames) // 6
+    includes_current_orientation = orientation_frames > 0
+    if state[f"goal_norm.{mean_key}"].numel() != goal_dim:
         raise ValueError("Checkpoint goal normalizer disagrees with args.goal_frames")
 
     saved = checkpoint.get("task_settings")
@@ -303,7 +311,7 @@ def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
             )
             offset += width
     metadata = {
-        "schema_version": 2,
+        "schema_version": 4,
         "format": "torchscript",
         "task": task,
         "checkpoint": str(checkpoint_path),
@@ -332,6 +340,9 @@ def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
                 "shape": ["batch", goal_dim],
                 "dtype": "float32",
                 "goal_frames": goal_frames,
+                "future_frame_dim": GOAL_FRAME_DIM,
+                "includes_current_reference_orientation": includes_current_orientation,
+                "reference_orientation_history": orientation_frames,
                 "normalization": "included; pass MotionLib.goal features without additional normalization",
             },
         },
@@ -367,6 +378,15 @@ def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
             {"name": "future_joint_velocity_times_0.1", "offset": 44, "width": 29},
         ],
         "goal_order": "future reference frames f+1 through f+K; hold final pose and zero synthetic velocities after clip end",
+        "goal_layout_suffix": ([{
+            "name": "reference_orientation_history" if orientation_frames > 1 else "current_reference_orientation_in_current_robot_frame",
+            "offset": GOAL_FRAME_DIM * goal_frames,
+            "width": 6 * orientation_frames,
+            "history": orientation_frames,
+            "frame_width": 6,
+            "order": "oldest_to_newest",
+            "source": "For each past/current sample: mat_to_6d(transpose(robot_root_rotation_at_sample) @ reference_root_rotation[reference_frame_at_sample])",
+        }] if includes_current_orientation else []),
         "rotation_6d": "first two matrix columns, row-major flatten as in rotations.mat_to_6d",
         "joint_names": list(G1_JOINT_NAMES),
         "default_joint_position": default_joint_pos_list(),
@@ -387,6 +407,32 @@ def load_export_inputs(checkpoint_path: Path, task: str = "g1"):
             "The export is a policy network, not a standalone simulator or complete hardware controller.",
         ],
     }
+    if includes_current_orientation:
+        metadata["goal_order"] += "; append reference orientation history oldest-to-newest after the complete future sequence"
+        metadata["caller_responsibilities"].append(
+            "Maintain goal_layout_suffix.history relative-orientation samples, each using that sample's robot/reference rotations; on reset repeat the initial sample. Flatten by time and append after the future reference sequence."
+        )
+    if empirical:
+        anchor_obs = arguments.get("anchor_obs", True)
+        metadata.update(schema_version=5, normalization_type="EmpiricalNormalization",
+                        normalizer_epsilon=0.01, normalizer_epsilon_convention="sqrt(variance) + epsilon",
+                        normalizer_momentum=None, anchor_obs=anchor_obs, activation="SiLU",
+                        goal_order="frames f through f+K-1; stop tracking when f+K-1 reaches the last reference frame",
+                        clip_end_rule="current_frame + goal_frames - 1 >= last_reference_frame")
+        metadata["inputs"]["obs_history"]["flatten_order"] = "term-major: all history of joint_pos, then joint_vel, base_ang_vel, gravity, previous_action; oldest first within each term"
+        metadata["inputs"]["motion_goal"].update(future_frame_dim=68, anchor_obs=anchor_obs)
+        metadata["goal_layout_per_frame"] = [dict(name=name, offset=offset, width=width) for name,offset,width in (
+            ("joint_position_minus_default",0,29), ("joint_velocity",29,29),
+            ("projected_gravity_body",58,3), ("angular_velocity_body",61,3),
+            ("linear_velocity_heading",64,3), ("root_height",67,1))]
+        metadata["goal_layout_suffix"] = ([dict(name="anchor_obs", offset=68*goal_frames, width=9,
+            anchor_body="torso_link", source="reference torso position (3) and orientation columns (6) in current robot torso frame")]
+            if anchor_obs else [])
+        for term in metadata["observation_layout"]:
+            if term["name"] == "joint_pos":
+                term["unscaled_source"] = "joint_position + joint_calibration_offset - default_joint_position"
+        metadata["caller_responsibilities"][2] = "Flatten history by observation term using MDP.flatten_history()."
+        metadata["caller_responsibilities"][3] = "Build 68*K reference features using MotionLib.goal(); append MDP.anchor_observation() when anchor_obs is true."
     return model_nn, metadata
 
 
@@ -407,6 +453,7 @@ def _component_metadata(metadata, name, policy, fingerprint):
         result["included_operations"] = ["goal normalization", "motion encoder", "tanh"]
         result["caller_responsibilities"] = [
             "Build future motion goals using MotionLib.goal conventions.",
+            "Include goal_layout_suffix when present; each history sample uses its own past/current robot and reference, not future reference frames.",
             "Pass the returned latent directly to a matching decoder; do not normalize or tanh again.",
             "Use components with the same policy_fingerprint.",
         ]
@@ -448,7 +495,7 @@ def _fingerprint(policy):
 
 
 @torch.no_grad()
-def _export_components(checkpoint_path, outputs, task, check_inputs=False):
+def _export_components(checkpoint_path, outputs, task, check_inputs=False, checkpoint_data=None):
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     paths = {}
     for name, value in outputs.items():
@@ -463,7 +510,7 @@ def _export_components(checkpoint_path, outputs, task, check_inputs=False):
         raise ValueError("Export output must not overwrite its source checkpoint")
     if any(path.is_dir() for path in destinations):
         raise IsADirectoryError("Export destinations must be files")
-    policy, metadata = load_export_inputs(checkpoint_path, task)
+    policy, metadata = load_export_inputs(checkpoint_path, task, checkpoint_data=checkpoint_data)
     # A TorchScript constant removes the whole validation branch when disabled.
     policy.check_inputs = check_inputs
     metadata["input_shape_checks"] = check_inputs
@@ -591,8 +638,9 @@ def export_all(
     task: str = "g1",
     *,
     check_inputs: bool = False,
+    checkpoint_data: dict | None = None,
 ):
-    """Export policy plus <stem>_encoder and <stem>_decoder with matching metadata."""
+    """Export a bundle; an optional loaded snapshot keeps exports aligned with play."""
     output = _default_output(checkpoint_path) if output_path is None else Path(output_path)
     return _export_components(
         checkpoint_path,
@@ -603,6 +651,7 @@ def export_all(
         },
         task,
         check_inputs,
+        checkpoint_data,
     )
 
 
@@ -616,7 +665,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--task",
-        choices=("g1",),
+        choices=("volleyball", "g1"),
         default="g1",
         help="Model metadata fallback for legacy checkpoints without task_settings",
     )

@@ -17,7 +17,7 @@ from supermimic.training.trainer import Trainer
 
 def evidence():
     args = train_parser(False).parse_args([])
-    # Exactly the first collection on resume: replay is fresh and no warmup runs.
+    # A deliberately undersized buffer probe; current main trainer warms up again on resume.
     replay = ReplayBuffer(16, 1, "cpu")
     for _ in range(int(1.0 / args.utd)):
         replay.add({name: value[0].clone() for name, value in replay.data.items()})
@@ -32,10 +32,9 @@ def evidence():
     # Probe actual loss reduction with a controlled unit-error state head.
     learner = Trainer.__new__(Trainer)
     learner.wm = SimpleNamespace(
-        out_norm=SimpleNamespace(std=lambda: torch.ones(70)),
+        error_scale=torch.ones(70),
         state_error=lambda predicted, target: torch.ones(2, 8, 70),
     )
-    learner.ERR_FLOOR = torch.zeros(70)
     loss, _ = learner._wm_err(None, torch.zeros(2, 8, 71), torch.ones(2, 8))
     # Multiple completed environments can address the same bin in a single update.
     bins = torch.tensor([0, 0])
@@ -61,8 +60,8 @@ def evidence():
         },
         "world_model_loss_unit_error": {
             "code": loss.item(),
-            "paper_raw_sum_over_70_components": 8 * 70,
-            "note": "Controlled unit std; production additionally divides by running std and floors.",
+            "sum_over_70_components_averaged_over_time": 70,
+            "note": "Controlled unit error scales; production uses fixed Reproduced state error scales.",
         },
         "default_schedule": {
             "wm_only_iters": args.wm_only_iters,
@@ -70,7 +69,7 @@ def evidence():
             "amp": args.amp,
             "iterations": args.iterations,
         },
-        "resume": {
+        "undersized_buffer_probe": {
             "fresh_replay_size": replay.size,
             "required_window": args.wm_window,
             "error": resume,

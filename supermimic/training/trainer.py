@@ -19,7 +19,7 @@ from supermimic.mdp import (
     normalize_xi,
     unflatten_state,
 )
-from supermimic.motion import MotionLib
+from supermimic.motion import MotionLib, motion_goal_dim
 from supermimic import networks
 from supermimic.networks import Critic, Policy, WorldModel
 from supermimic.robot_spec import default_joint_pos_list
@@ -33,15 +33,23 @@ def set_requires_grad(m: nn.Module, flag: bool):
 class Trainer:
     def __init__(self, args, device="cuda:0", env_cfg=None):
         if args.resume:
-            raise ValueError(
-                "Resume is unavailable because replay-buffer restoration is not implemented; start a fresh run"
-            )
+            raise ValueError("Resume is unavailable because replay-buffer restoration is not implemented; start a fresh run")
         self.args = args
+        self.anchor_obs = args.anchor_obs = getattr(args, "anchor_obs", True)
+        args.termination_head = getattr(args, "termination_head", "neural")
+        args.term_loss_weight = getattr(args, "term_loss_weight", 1.0)
+        if args.term_loss_weight < 0:
+            raise ValueError("term_loss_weight must be nonnegative")
+        self.policy_norm_frozen = False
         self.task_settings = None
         if env_cfg is not None:
             env_cfg.prepare()
+            if any(getattr(env_cfg, name).reference_orientation is not None for name in
+                   ("critic_observation", "world_model_observation")):
+                raise ValueError("New training does not support extra reference_orientation in critic or world model")
             env_cfg.policy_observation.history = args.hist
             env_cfg.commands.motion.goal_frames = args.goal_frames
+            env_cfg.commands.motion.anchor_obs = self.anchor_obs
             from supermimic.tasks.tracking.settings import task_settings
 
             self.task_settings = task_settings(env_cfg)
@@ -72,11 +80,15 @@ class Trainer:
             self.args.hist,
             self.args.horizon,
         )
-        self.GOAL_DIM = 73 * self.K
+        self.motion.validate_goal_window(self.K)
+        if not bool((self.motion.tracking_end(self.K) - self.motion.clip_start >= self.HZ).any()):
+            raise ValueError("No motion clip has enough frames for goal_frames and imagination horizon")
+        self.GOAL_DIM = motion_goal_dim(self.K, self.anchor_obs)
         self.CRITIC_IN = STATE_DIM + self.mdp.critic_extra + self.GOAL_DIM
         self.xi_dim = XI_DIM if env_cfg is None else env_cfg.randomization.context_dim
         self.wm = WorldModel(
-            **({} if self.xi_dim == XI_DIM else {"xi_dim": self.xi_dim})
+            xi_dim=self.xi_dim, termination_head=args.termination_head,
+            height_thr=self.mdp.cfg.term_height, tilt_thr=self.mdp.cfg.term_tilt
         ).to(self.dev)
         self.pi = Policy(self.mdp.obs_dim, self.GOAL_DIM, hist=self.Hh).to(self.dev)
         self.critic = Critic(self.CRITIC_IN).to(self.dev)
@@ -86,6 +98,36 @@ class Trainer:
         )
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=self.args.lr)
         (self.start_it, self.wall_offset, self.sim_steps) = (0, 0.0, 0)
+        if self.args.resume:
+            ck = torch.load(self.args.resume, map_location=self.dev)
+            if ck.get("model_input_version") != networks.MODEL_INPUT_VERSION:
+                raise ValueError("Checkpoint uses older world-model/critic inputs; start a fresh training run")
+            for name in ("anchor_obs", "termination_head", "hist", "goal_frames"):
+                if ck["args"].get(name) != getattr(args, name):
+                    raise ValueError(f"Resume {name} differs from checkpoint")
+            from supermimic.tasks.tracking.settings import same_settings
+
+            if ck.get("task_settings") is not None and not same_settings(
+                ck["task_settings"], self.task_settings
+            ):
+                raise ValueError(
+                    "Resume task settings differ from checkpoint; restore its settings before training"
+                )
+            (
+                self.wm.load_state_dict(ck["wm"]),
+                self.pi.load_state_dict(ck["pi"]),
+                self.critic.load_state_dict(ck["critic"]),
+            )
+            (
+                self.opt_wm.load_state_dict(ck["opt_wm"]),
+                self.opt_pi.load_state_dict(ck["opt_pi"]),
+                self.opt_v.load_state_dict(ck["opt_v"]),
+            )
+            (self.start_it, self.wall_offset, self.sim_steps) = (
+                ck["iteration"],
+                ck["wall_time"],
+                ck["sim_steps"],
+            )
         os.makedirs(self.args.log_dir, exist_ok=True)
         with open(os.path.join(self.args.log_dir, "args.json"), "w") as stream:
             json.dump(vars(self.args), stream, indent=2)
@@ -93,16 +135,6 @@ class Trainer:
             from supermimic.tasks.tracking.settings import save_task_settings
 
             save_task_settings(self.args.log_dir, self.task_settings)
-        self.ERR_FLOOR = torch.cat(
-            (
-                torch.full((3,), 0.003),
-                torch.full((3,), 0.005),
-                torch.full((3,), 0.02),
-                torch.full((3,), 0.05),
-                torch.full((29,), 0.003),
-                torch.full((29,), 0.05),
-            )
-        ).to(self.dev)
         self.wm_rollout = torch.compile(self._wm_rollout)
         self.wm_err = torch.compile(self._wm_err)
         self.imag_step = torch.compile(self._imag_step)
@@ -116,27 +148,28 @@ class Trainer:
         for j in range(self.args.wm_window):
             S = self.wm.step(S, a[:, j], normalize_xi(xi[:, j]))
             preds.append(S)
-        return tuple((torch.stack([P[i] for P in preds], 1) for i in range(6)))
+        states = tuple((torch.stack([P[i] for P in preds], 1) for i in range(6)))
+        return states
 
     def _wm_err(self, S_hat, s1, mask):
-        std = torch.maximum(self.wm.out_norm.std(), self.ERR_FLOOR)
-        e = (self.wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2
-        e = e.mean(-1)
-        return ((e * mask).sum() / s1.shape[0], e[:, -1])
+        target = unflatten_state(s1)
+        e = (self.wm.state_error(S_hat, target) / self.wm.error_scale) ** 2
+        # Reproduced state loss sums the 70 quantities, then averages time and batch.
+        return ((e.sum(-1) * mask).mean(), e.mean(-1)[:, -1])
 
     def _imag_step(self, S, o_hist, a_prev, f, xi, xi_n, g):
-        a = self.pi(o_hist.flatten(-2), g)
+        a = self.pi(self.mdp.flatten_history(o_hist), g)
         S1 = self.wm.step(S, a, xi_n)
         f1 = f + 1
         o1 = self.mdp.add_noise(self.mdp.obs(S1, a, xi, f1))
         o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-        return (S1, a, o_hist, f1, self.motion.goal(f1, self.K))
+        return (S1, a, o_hist, f1, self.mdp.goal(S1, f1, self.K, self.anchor_obs, noise=True))
 
     def _reward_term(self, S, f, a, a_prev):
-        return (self.mdp.reward(S, f, a, a_prev), self.mdp.soft_termination(S, f))
+        return (self.mdp.reward(S, f, a, a_prev), self.wm.termination_probability(self.mdp, S, f))
 
     def _critic_input(self, S, f, xi_n, g):
-        return self.mdp.critic_features(S, g, xi_n)
+        return self.mdp.critic_features(S, g, xi_n, f)
 
     def lr_at(self, it: int) -> float:
         if it >= self.args.lr_decay_iters:
@@ -147,15 +180,25 @@ class Trainer:
 
     def wm_update(self):
         w = self.buffer.sample_windows(self.args.wm_batch, self.args.wm_window)
-        S_hat = self.wm_rollout(w["s"], w["a"], w["xi"])
-        (loss, e_last) = self.wm_err(S_hat, w["s1"], w["mask"])
+        prediction = self.wm_rollout(w["s"], w["a"], w["xi"])
+        (loss, e_last) = self.wm_err(prediction, w["s1"], w["mask"])
+        term_bce = loss.new_zeros(())
+        if self.wm.term_head is not None:
+            # The stored terminal state is before auto-reset; labels exclude timeouts.
+            f_next = torch.minimum(w["f"]+1, self.motion.clip_end[self.motion.clip_id[w["f"]]])
+            logits = self.wm.term_head(self.mdp.termination_features(prediction, f_next))
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits, w["term"].float(), reduction="none")
+            term_bce = (bce * w["mask"]).mean()
+            loss = loss + self.args.term_loss_weight * term_bce
+        self.last_term_bce = term_bce.detach()
         self.opt_wm.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
         self.opt_wm.step()
         m = w["mask"][:, -1]
         return (
-            loss.detach() / self.args.wm_window,
+            loss.detach(),
             (e_last.detach() * m).sum() / m.sum().clamp(min=1),
         )
 
@@ -164,7 +207,7 @@ class Trainer:
         while n < B:
             (s, h) = self.buffer.sample_starts(2 * B, self.Hh)
             f = s["f"]
-            ok = f + self.HZ <= self.motion.clip_end[self.motion.clip_id[f]]
+            ok = f + self.HZ <= self.motion.tracking_end(self.K)[self.motion.clip_id[f]]
             idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
             (
                 starts.append({k: v[idx] for (k, v) in s.items()}),
@@ -188,7 +231,7 @@ class Trainer:
         set_requires_grad(self.wm, False)
         set_requires_grad(self.critic, False)
         B = self.args.pi_batch
-        g0 = self.motion.goal(f, self.K)
+        g0 = self.mdp.goal(S, f, self.K, self.anchor_obs, noise=True)
         g = g0
         S0 = S
         (Ss, As, Aps, Fs, Gs) = ([], [], [], [], [])
@@ -287,6 +330,13 @@ class Trainer:
             c.mean().detach(),
         )
 
+    def _set_policy_norm_phase(self, completed_iterations):
+        cutoff = getattr(self.args, "freeze_policy_norm_at", None)
+        frozen = cutoff is not None and completed_iterations >= cutoff
+        if frozen and not self.policy_norm_frozen:
+            print(f"Actor obs/goal normalization frozen after {completed_iterations} completed iterations.", flush=True)
+        self.policy_norm_frozen = frozen
+
     @torch.no_grad()
     def collect(self, n_steps: int, stats: dict):
         for _ in range(n_steps):
@@ -300,10 +350,11 @@ class Trainer:
                 o.unsqueeze(1).expand_as(self.obs_hist),
                 torch.cat((self.obs_hist[:, 1:], o.unsqueeze(1)), 1),
             )
-            g = self.motion.goal(self.env.f, self.K)
-            self.pi.obs_norm.update(o)
-            self.pi.goal_norm.update(g)
-            a = self.pi(self.obs_hist.flatten(-2), g)
+            g = self.mdp.goal(S, self.env.f, self.K, self.anchor_obs, noise=True)
+            if not self.policy_norm_frozen:
+                self.pi.obs_norm.update(self.mdp.flatten_history(self.obs_hist))
+                self.pi.goal_norm.update(g)
+            a = self.pi(self.mdp.flatten_history(self.obs_hist), g)
             a = torch.clamp(a + self.args.action_noise * torch.randn_like(a), -20, 20)
             out = self.env.step(a)
             self.buffer.add(out)
@@ -311,7 +362,10 @@ class Trainer:
             self.wm.in_norm.update(
                 self.wm.inputs(S0, out["a"], normalize_xi(out["xi"]))
             )
-            self.wm.out_norm.update(self.wm.targets(S0, S1))
+            if self.wm.term_head is not None:
+                f_next = torch.minimum(out["f"]+1, self.motion.clip_end[self.motion.clip_id[out["f"]]])
+                self.wm.term_head.norm.update(
+                    self.wm.term_head.inputs(self.mdp.termination_features(S1, f_next)))
             self.sim_steps += self.args.num_envs
             stats["r"].append(out["r"].mean() / self.mdp.max_step_reward)
             if "ep_len" in out:
@@ -328,19 +382,21 @@ class Trainer:
         self.obs_hist = torch.zeros(
             self.args.num_envs, self.Hh, self.mdp.obs_dim, device=self.dev
         )
+        self.policy_norm_frozen = False
+        self._set_policy_norm_phase(self.start_it)
         stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
-        if self.start_it == 0:
-            self.collect(self.args.warmup_steps, stats)
+        self.collect(self.args.warmup_steps, stats)
         log_f = open(os.path.join(self.args.log_dir, "train_log.csv"), "a")
         if self.start_it == 0:
             log_f.write(
-                "iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n"
+                "iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr,term_bce\n"
             )
         t_start = time.time() - self.wall_offset
         t_log = time.time()
         step_acc = 0.0
-        agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+        agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": [], "term_bce": []}
         for it in range(self.start_it, self.args.iterations):
+            self._set_policy_norm_phase(it)
             lr = self.lr_at(it)
             for o in (self.opt_wm, self.opt_pi, self.opt_v):
                 for gparam in o.param_groups:
@@ -362,6 +418,7 @@ class Trainer:
                 torch.cuda.synchronize()
                 tp2 = time.time()
             (agg["wm"].append(l), agg["wm8"].append(e8))
+            agg["term_bce"].append(self.last_term_bce)
             if it >= self.args.wm_only_iters:
                 (pl, vl, ir, gn, surv) = self.policy_update()
                 if prof:
@@ -404,6 +461,7 @@ class Trainer:
                     term_frac,
                     ips,
                     lr,
+                    mean(agg["term_bce"]),
                 ]
                 log_f.write(
                     ",".join(

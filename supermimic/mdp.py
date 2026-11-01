@@ -60,7 +60,7 @@ def unflatten_state(x: torch.Tensor):
 
 
 def invariant_features(S) -> torch.Tensor:
-    """Heading- and position-invariant state features: height, tilt (6D), body-frame velocities, joints."""
+    """Heading- and position-invariant state features: height, tilt (6D), heading linear velocity, body angular velocity, joints."""
     p, R, v, w, q, qd = S
     H = yaw_mat(R)
     Rt = R.transpose(-1, -2)
@@ -68,7 +68,7 @@ def invariant_features(S) -> torch.Tensor:
         (
             p[..., 2:3],
             mat_to_6d(H.transpose(-1, -2) @ R),
-            (Rt @ v.unsqueeze(-1)).squeeze(-1),
+            (H.transpose(-1, -2) @ v.unsqueeze(-1)).squeeze(-1),
             (Rt @ w.unsqueeze(-1)).squeeze(-1),
             q,
             qd,
@@ -102,7 +102,10 @@ class MDP:
             )
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.xi_dim = xi_dim
-        self.critic_extra = xi_dim
+        self.critic_extra = xi_dim + 4
+        self.legacy_inputs = False
+        self.motion.default_q = default_q
+        self.anchor_index = [kin.body_names[i] for i in kin.tracked_idx].index("torso_link")
         self.max_step_reward = cfg.max_reward_rate * CONTROL_DT
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
@@ -118,6 +121,7 @@ class MDP:
         ]
         self._obs_selection = tuple(i for i, _, _ in selected)
         self.obs_dim = self.observation_cfg.dim
+        self.obs_widths = tuple(width for _, width, _ in selected)
         self.obs_scale = torch.cat(
             [torch.full((width,), term.scale) for _, width, term in selected]
         ).to(dev)
@@ -136,7 +140,7 @@ class MDP:
         dq0 = xi[..., 1:30]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
         values = (
-            q - self.default_q - dq0,
+            q - self.default_q + (-dq0 if self.legacy_inputs else dq0),
             qd,
             (Rt @ w.unsqueeze(-1)).squeeze(-1),
             g_b,
@@ -228,12 +232,54 @@ class MDP:
         )
         return 1 - alive
 
-    def critic_features(self, S, goal, xi) -> torch.Tensor:
-        """Table A.4 input groups: full state, goal, normalized sim context."""
-        return torch.cat((flatten_state(S), goal, xi), -1)
+    def reference_orientation(self, S, f) -> torch.Tensor:
+        """Legacy policy playback: reference rotation in the robot frame."""
+        return mat_to_6d(S[1].transpose(-1, -2) @ self.motion.root_R[f])
+
+    def flatten_history(self, hist):
+        """[B,H,D] -> [B,H*D], term-major (old checkpoints remain frame-major)."""
+        if self.legacy_inputs:
+            return hist.flatten(-2)
+        return torch.cat([part.flatten(-2) for part in hist.split(self.obs_widths, -1)], -1)
+
+    def anchor_observation(self, S, f):
+        """Reference torso pose in the current robot torso frame (3+6)."""
+        bp, bR, _, _ = self.kin.forward(*S)
+        i = self.anchor_index
+        Rt = bR[..., i, :, :].transpose(-1, -2)
+        dp = (Rt @ (self.motion.body_p[f][..., i, :]-bp[..., i, :]).unsqueeze(-1)).squeeze(-1)
+        ori = mat_to_6d(Rt @ self.motion.body_R[f][..., i, :, :])
+        return torch.cat((dp, ori), -1)
+
+    def goal(self, S, f, K, anchor_obs=True, noise=False):
+        g = self.motion.goal(f, K)
+        if not anchor_obs:
+            return g
+        anchor = self.anchor_observation(S, f)
+        if noise and self.observation_cfg.noise_enabled:
+            scale = anchor.new_tensor([0.25]*3 + [0.05]*6)
+            anchor = anchor + (2*torch.rand_like(anchor)-1)*scale
+        return torch.cat((g, anchor), -1)
+
+    def termination_features(self, S, f):
+        # Match reproduced signed height and projected-gravity-z errors.
+        height = self.motion.root_p[f][..., 2] - S[0][..., 2]
+        tilt = S[1][..., 2, 2] - self.motion.root_R[f][..., 2, 2]
+        return torch.stack((height, tilt), -1)
+
+    def root_error_features(self, S, f):
+        p, R = S[:2]
+        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
+        dp = (yaw_mat(rR).transpose(-1,-2) @ (p-rp).unsqueeze(-1)).squeeze(-1)
+        dyaw = torch.atan2(R[...,1,0],R[...,0,0])-torch.atan2(rR[...,1,0],rR[...,0,0])
+        dyaw = torch.remainder(dyaw+torch.pi, 2*torch.pi)-torch.pi
+        return torch.cat((dp, dyaw.unsqueeze(-1)), -1)
+
+    def critic_features(self, S, goal, xi, f) -> torch.Tensor:
+        return torch.cat((invariant_features(S), goal, xi, self.root_error_features(S, f)), -1)
 
 
-CRITIC_EXTRA = XI_DIM
+CRITIC_EXTRA = XI_DIM + 4
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:

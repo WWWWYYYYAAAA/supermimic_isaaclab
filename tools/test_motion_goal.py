@@ -48,13 +48,13 @@ class MotionGoalTest(unittest.TestCase):
 
     def test_in_clip_goals_keep_recorded_features(self):
         frames = torch.tensor([0, 4])
-        actual = self.lib.goal(frames, 2)
+        actual = self.lib.legacy_goal(frames, 2)
         self.assertEqual(actual.shape, (2, 146))
         torch.testing.assert_close(actual.reshape(2, 2, 73), self.expected(frames, 2))
 
     def test_mixed_clip_boundaries_hold_pose_and_zero_only_padding(self):
         frames = torch.tensor([2, 6])
-        actual = self.lib.goal(frames, 4).reshape(2, 4, 73)
+        actual = self.lib.legacy_goal(frames, 4).reshape(2, 4, 73)
         torch.testing.assert_close(actual, self.expected(frames, 4))
         for row, last_recorded in enumerate((0, 2)):
             end = self.lib.clip_end[row]
@@ -77,7 +77,7 @@ class MotionGoalTest(unittest.TestCase):
         frames = lib.clip_end.clone()
         before = tuple(value.clone() for value in lib.ref_state(frames))
         for _ in range(2):
-            actual = lib.goal(frames, 3).reshape(2, 3, 73)
+            actual = lib.legacy_goal(frames, 3).reshape(2, 3, 73)
             torch.testing.assert_close(actual, self.expected(frames, 3))
         torch.testing.assert_close(frames, source["clip_end"], rtol=0, atol=0)
         for name, value in source.items():

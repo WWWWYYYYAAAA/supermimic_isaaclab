@@ -16,6 +16,7 @@ FIELDS = {
     "f": ((), torch.long),
     "ep_step": ((), torch.int32),
     "done": ((), torch.bool),
+    "term": ((), torch.bool),
 }
 
 
@@ -47,7 +48,7 @@ class ReplayBuffer:
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
         rows = self._row(ages)
         e = env.unsqueeze(-1).expand_as(rows)
-        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done")}
+        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done", "term", "f")}
         # transition j is valid if no episode ended at transitions 0..j-1
         d = out["done"].float()
         mask = torch.cumprod(

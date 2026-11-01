@@ -5,6 +5,13 @@ import os
 from supermimic.paths import REPO
 
 
+def _positive_iteration(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("iteration must be a positive integer")
+    return value
+
+
 def train_parser(include_launcher=True):
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_envs", type=int, default=4096)
@@ -15,6 +22,10 @@ def train_parser(include_launcher=True):
     )
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--goal_frames", type=int, default=10)
+    parser.add_argument("--anchor_obs", "--anchor-obs", action=argparse.BooleanOptionalAction, default=True,
+                        help="Append reference torso pose in robot torso frame to motion goal")
+    parser.add_argument("--termination_head", "--termination-head", choices=("neural", "analytic"), default="neural")
+    parser.add_argument("--term_loss_weight", type=float, default=1.0)
     parser.add_argument("--hist", type=int, default=10)
     parser.add_argument("--wm_window", type=int, default=8)
     parser.add_argument("--wm_batches", type=int, default=10)
@@ -39,6 +50,8 @@ def train_parser(include_launcher=True):
     parser.add_argument("--lr_decay_iters", type=int, default=250_000)
     parser.add_argument("--ckpt_every", type=int, default=2000)
     parser.add_argument("--last_every", type=int, default=200)
+    parser.add_argument("--freeze_policy_norm_at", "--freeze-policy-norm-at", type=_positive_iteration,
+                        default=None, help="Freeze actor empirical statistics after N completed iterations")
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument(
         "--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1")

@@ -17,10 +17,10 @@ B = 2048
 f = torch.randint(0, motion.num_frames - 20, (B * 8,), device=dev)
 S = motion.ref_state(f); S1 = motion.ref_state(f + 1)
 a = torch.randn(B * 8, 29, device=dev); xi = torch.zeros(B * 8, 33, device=dev); xi[:, 0] = 0.75
-wm.in_norm.update(wm.inputs(S, a, normalize_xi(xi))); wm.out_norm.update(wm.targets(S, S1))
-std = wm.out_norm.std()
+wm.in_norm.update(wm.inputs(S, a, normalize_xi(xi)))
+std = wm.error_scale
 names = ["dp"] * 3 + ["dth"] * 3 + ["dv"] * 3 + ["dw"] * 3 + ["dq"] * 29 + ["dqd"] * 29
-print("out std per group:", {n: f"{std[[i for i, m in enumerate(names) if m == n]].min().item():.2e}..{std[[i for i, m in enumerate(names) if m == n]].max().item():.2e}" for n in dict.fromkeys(names)})
+print("state error scales:", {n: f"{std[[i for i, m in enumerate(names) if m == n]].min().item():.2e}..{std[[i for i, m in enumerate(names) if m == n]].max().item():.2e}" for n in dict.fromkeys(names)})
 def timeit(fn, n=5):
     fn(); torch.cuda.synchronize(); t = time.time()
     for _ in range(n): fn()
@@ -35,9 +35,9 @@ fb = f[:4096]
 print("FK fwd (B=4096): %.2f ms" % (1000 * timeit(lambda: kin.forward(*Sb4))))
 print("reward fwd+bwd: %.2f ms" % (1000 * timeit(lambda: mdp.reward(Sb4, fb, a[:4096], a[:4096]).sum().backward())))
 print("obs fwd: %.2f ms" % (1000 * timeit(lambda: mdp.obs(Sb4, a[:4096], xi[:4096], fb))))
-print("goal: %.2f ms" % (1000 * timeit(lambda: motion.goal(fb, 10))))
-gb = motion.goal(fb, 10)
-print("critic feats: %.2f ms" % (1000 * timeit(lambda: mdp.critic_features(Sb4, gb, normalize_xi(xi[:4096])))))
+print("goal: %.2f ms" % (1000 * timeit(lambda: mdp.goal(Sb4, fb, 10))))
+gb = mdp.goal(Sb4, fb, 10)
+print("critic feats: %.2f ms" % (1000 * timeit(lambda: mdp.critic_features(Sb4, gb, normalize_xi(xi[:4096]), fb))))
 print("---- torch.compile ----")
 kin_fwd_c = torch.compile(kin.forward)
 t0 = time.time(); kin_fwd_c(*Sb4); torch.cuda.synchronize(); print("compile FK %.1fs" % (time.time() - t0))

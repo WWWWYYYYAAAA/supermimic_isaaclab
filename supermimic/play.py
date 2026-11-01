@@ -140,6 +140,7 @@ def prepare_playback(args) -> Playback:
             raise ValueError("Checkpoint goal size and saved task settings disagree")
     cfg.policy_observation.history = saved_args["hist"]
     cfg.commands.motion.goal_frames = saved_args["goal_frames"]
+    cfg.commands.motion.anchor_obs = saved_args.get("anchor_obs", checkpoint.get("model_input_version", 0) >= 7)
     if args.self_collisions is not None:
         cfg.self_collisions = args.self_collisions
     cfg.scene.num_envs = 1
@@ -299,7 +300,7 @@ def build_runtime(playback, device):
     from supermimic import networks
     from supermimic.kinematics import G1Kinematics
     from supermimic.mdp import MDP
-    from supermimic.motion import MotionLib
+    from supermimic.motion import MotionLib, checkpoint_goal_dim
     from supermimic.robot_spec import default_joint_pos_list
 
     cfg = playback.env_cfg
@@ -316,11 +317,10 @@ def build_runtime(playback, device):
         observation_cfg=cfg.policy_observation,
         xi_dim=cfg.randomization.context_dim,
     )
-    policy = networks.Policy(
-        mdp.obs_dim, 73 * saved["goal_frames"], hist=saved["hist"]
-    ).to(device)
+    mdp.legacy_inputs = ck.get("model_input_version", 0) < 7
+    cfg.commands.motion.anchor_obs = saved.get("anchor_obs", False) if mdp.legacy_inputs else saved.get("anchor_obs", True)
     try:
-        policy.load_state_dict(ck["pi"])
+        policy = networks.policy_from_checkpoint(ck, mdp.obs_dim).to(device)
     except RuntimeError as exc:
         raise ValueError(
             "Checkpoint policy shapes do not match the restored observation/goal settings"
@@ -332,11 +332,13 @@ def build_runtime(playback, device):
 def play_loop(env, policy, motion, mdp, args, mjcf_path, *, viewer_factory=None):
     """Run one simulated environment; optional viewer resources are always closed."""
     import torch
-    from supermimic.motion import CONTROL_DT
+    from supermimic.motion import CONTROL_DT, motion_goal_dim, update_orientation_history
     from supermimic.rotations import mat_to_quat
 
     saved_history = args.history_length
     goal_frames = args.goal_frames
+    goal_dim = getattr(policy, "goal_dim", motion_goal_dim(goal_frames))
+    orientation_history = None
     ids = torch.zeros(1, dtype=torch.long, device=env.device)
     keys = queue.SimpleQueue()
     clip_index = steps = episode_steps = 0
@@ -346,7 +348,7 @@ def play_loop(env, policy, motion, mdp, args, mjcf_path, *, viewer_factory=None)
     mouse = None
 
     def reset():
-        nonlocal hist, total_reward, episode_steps, hold_until
+        nonlocal hist, total_reward, episode_steps, hold_until, orientation_history
         if mouse is not None:
             with viewer.lock():
                 mouse.clear(viewer.perturb)
@@ -355,7 +357,8 @@ def play_loop(env, policy, motion, mdp, args, mjcf_path, *, viewer_factory=None)
         env.reset(ids, motion.clip_start[clip_index : clip_index + 1])
         env.refresh()
         hist, total_reward, episode_steps, hold_until = None, 0.0, 0, None
-        duration = (int(motion.clip_len[clip_index]) - 1) * CONTROL_DT
+        orientation_history = None
+        duration = (int(motion.clip_len[clip_index]) - goal_frames) * CONTROL_DT
         print(f"Playing {motion.names[clip_index]} ({duration:.2f}s)", flush=True)
 
     def display_state():
@@ -428,13 +431,19 @@ def play_loop(env, policy, motion, mdp, args, mjcf_path, *, viewer_factory=None)
                             clip_index = (clip_index + 1) % len(motion.names)
                             reset()
                     else:
-                        obs = mdp.obs(env.state(), env.a_prev, env.xi, env.f)
+                        state = env.state()
+                        obs = mdp.obs(state, env.a_prev, env.xi, env.f)
                         hist = (
                             obs[:, None].repeat(1, saved_history, 1)
                             if hist is None
                             else torch.cat((hist[:, 1:], obs[:, None]), dim=1)
                         )
-                        action = policy(hist.flatten(-2), motion.goal(env.f, goal_frames))
+                        if mdp.legacy_inputs and goal_dim > 73*goal_frames:
+                            orientation_history = update_orientation_history(
+                                orientation_history, mdp.reference_orientation(state, env.f), saved_history)
+                        goal = (motion.policy_goal(env.f, goal_frames, state[1], orientation_history, goal_dim)
+                                if mdp.legacy_inputs else mdp.goal(state, env.f, goal_frames, goal_dim == 68*goal_frames+9))
+                        action = policy(mdp.flatten_history(hist), goal)
                         if not torch.isfinite(action).all():
                             raise RuntimeError("Policy produced nonfinite actions")
                         if mouse is not None:

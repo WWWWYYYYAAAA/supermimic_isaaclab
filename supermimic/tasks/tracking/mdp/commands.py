@@ -20,6 +20,7 @@ class ReferenceMotionCommand(CommandTerm):
         assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
         self.N = env.num_envs
         self.motion, self.mdp, self.gamma = env.motion, env.mdp, env.gamma
+        self.motion.validate_goal_window(cfg.goal_frames)
         self.eval_mode = env.eval_mode
         self.max_episode_steps = env.episode_steps if not env.eval_mode else 10**9
         self.control_cfg = getattr(env.cfg, "control", PDControlCfg())
@@ -64,7 +65,7 @@ class ReferenceMotionCommand(CommandTerm):
 
     @property
     def command(self):
-        return self.motion.goal(self.f, self.cfg.goal_frames)
+        return self.mdp.goal(self.state(), self.f, self.cfg.goal_frames, self.cfg.anchor_obs)
 
     def reset(self, env_ids=None):
         # Reset sampling belongs to the reset event, once per episode. Do not
@@ -103,14 +104,15 @@ class ReferenceMotionCommand(CommandTerm):
 
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
-        soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
+        # Exclude bins with no executable frame before the full goal touches the end.
+        bin_end = torch.minimum(m.bin_start + 50, m.tracking_end(self.cfg.goal_frames)[m.bin_clip])
+        valid = m.bin_start < bin_end
+        soft = torch.softmax((-25.0 * self.bin_G / self.G_max).masked_fill(~valid, -torch.inf), 0)
         self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
-        probs = (
-            0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
-        )
+        historical = self.bin_w_avg * valid
+        probs = 0.5 * valid / valid.sum() + 0.4 * soft + 0.1 * historical / historical.sum()
         bins = torch.multinomial(probs, n, replacement=True)
-        start = m.bin_start[bins]
-        end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])
+        start, end = m.bin_start[bins], bin_end[bins]
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return (f, bins)
 
@@ -167,3 +169,4 @@ class ReferenceMotionCommandCfg(CommandTermCfg):
     class_type: type = ReferenceMotionCommand
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
     goal_frames: int = 10
+    anchor_obs: bool = True

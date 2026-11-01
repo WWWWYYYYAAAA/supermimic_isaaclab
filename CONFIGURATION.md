@@ -98,14 +98,13 @@ pd_gains=PDGainRandomizationCfg(
 
 | 网络 | 输入顺序 | 默认宽度 |
 |---|---|---:|
-| Actor encoder | 未来 10 帧 reference goal | 730 |
-| Actor decoder | latent；按帧展平的历史观测 | 32 + 930 = 962 |
-| Critic | 完整 state；goal；归一化 context ξ | 71 + 730 + 33 = 834 |
-| World model | 完整 state；执行动作；归一化 context ξ | 71 + 29 + 33 = 133 |
+| Actor encoder | 当前起始的 10 帧参考 + 相对 torso anchor | 689 |
+| Actor decoder | latent + term-major history | 962 |
+| Critic | canonical state + goal + context + root drift | 797 |
+| World model | canonical state + action + context | 133 |
 
-完整 state 为 `[root_position(3), root_quaternion_wxyz(4), root_linear_velocity(3), root_angular_velocity(3), joint_position(29), joint_velocity(29)]`。根位置、旋转和速度采用环境世界坐标系，关节使用既定的 29 关节顺序。73 维单帧 goal 由 `MotionLib.goal` 构造。开启 PD 随机化后 critic/world model 输入分别变为 892/191 维。
-
-actor 使用 `BatchNorm1d(affine=False, eps=1e-4, momentum=0.1)`，仅仿真采集中的显式 `update()` 更新统计量；训练前向、想象 rollout、播放和导出均使用保存统计。历史缓冲为 `[B, H, D]`，调用端按帧展平为 `[B, H*D]`。critic/world model 使用原有 RunningNorm。
+所有输入使用 EmpiricalNormalization。完整布局、输出积分与 checkpoint 兼容说明见
+[NETWORK_INPUTS.md](NETWORK_INPUTS.md)。
 
 ## 配置快照和兼容性
 
@@ -113,6 +112,13 @@ actor 使用 `BatchNorm1d(affine=False, eps=1e-4, momentum=0.1)`，仅仿真采�
 
 快照包括 PD、随机化、奖励、观测、机器人资产、自碰撞、episode 长度和 goal 帧数；它不是完整 Isaac Lab 配置序列化。数据目录由 `--motion_dir` 指定，未存入任务快照；迁移数据后应显式传入新路径。
 
-新 checkpoint 使用 `model_input_version=2`，world model/critic 输入语义已与旧实现不同。观测维数、history、goal 帧数或 context 改变时需要新训练；即使尺寸相同，改变 scale 也会改变输入语义。旧 actor 的 `mean/var/count` 归一化键不能直接加载到当前 BatchNorm 策略。
+新 checkpoint 使用 `model_input_version=7`，world model/critic 输入语义已与旧实现不同。观测维数、history、goal 帧数或 context 改变时需要新训练；即使尺寸相同，改变 scale 也会改变输入语义。旧 actor 的 `mean/var/count` 归一化键不能直接加载到当前 EmpiricalNormalization 策略。
 
 训练入口目前拒绝 `--resume`，因为 replay 恢复尚未实现。控制时钟固定为 50 Hz（`sim.dt=0.02, decimation=1`），Newton 内部 4 个子步；任务校验会拒绝单独更改控制周期。
+
+## v7 network options
+
+`--anchor_obs` 默认开启；`--no-anchor_obs` 关闭。`--termination_head neural` 默认，
+可选 `--termination_head analytic`。`--term_loss_weight` 默认 1.0。
+这些选项由 checkpoint args 保存，anchor 也写入 task_settings；修改输入语义需新开训练。
+详细数据集到 goal 的变化见 [NETWORK_INPUTS.md](NETWORK_INPUTS.md)。

@@ -26,5 +26,6 @@ def tracking_failure(env):
 
 def clip_or_time_limit(env):
     ref = env.reference
-    clip_end = env.motion.clip_end[env.motion.clip_id[ref.f]]
-    return (ref.f + 1 >= clip_end) | (ref.ep_step + 1 >= ref.max_episode_steps)
+    # ref.f is the pre-step frame; test the arrived frame f_next = f + 1.
+    tracking_end = env.motion.tracking_end(ref.cfg.goal_frames)[env.motion.clip_id[ref.f]]
+    return (ref.f + 1 >= tracking_end) | (ref.ep_step + 1 >= ref.max_episode_steps)

@@ -136,7 +136,7 @@ class PlayTest(unittest.TestCase):
             self.assertFalse(result.env_cfg.self_collisions)
 
     def test_incompatible_policy_observation_shape_has_clear_error(self):
-        from supermimic.networks import Policy
+        from supermimic.legacy_policy import LegacyPolicy as Policy
 
         torch.set_num_threads(2)
         kin, motion, _ = make_motion()

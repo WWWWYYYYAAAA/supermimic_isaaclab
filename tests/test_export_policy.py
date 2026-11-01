@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from supermimic import networks
+from supermimic.legacy_policy import LegacyPolicy
 from supermimic.export_policy import export_policy, export_all, load_export_inputs
 from supermimic.paths import REPO
 from supermimic.tasks.tracking.control_cfg import PDControlCfg, joint_pd_parameters
@@ -30,7 +31,7 @@ def checkpoint(directory, *, configured=False):
         observation.joint_vel.scale = 0.1
         control.stiffness_overrides = {".*_knee_joint": 100.0}
     torch.manual_seed(381)
-    policy = networks.Policy(observation.dim, 146, hist=2).eval()
+    policy = LegacyPolicy(observation.dim, 146, hist=2).eval()
     policy.obs_norm.update(torch.randn(10, observation.dim) * 2 + 1)
     policy.goal_norm.update(torch.randn(10, 146) * 0.3 - 0.1)
     saved = {

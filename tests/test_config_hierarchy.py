@@ -52,7 +52,7 @@ class ConfigHierarchyTest(unittest.TestCase):
                 ),
                 patch(
                     "supermimic.training.trainer.WorldModel",
-                    side_effect=lambda: WorldModel(hidden=(16, 16)),
+                    side_effect=lambda **kw: WorldModel(hidden=(16, 16), **kw),
                 ),
                 patch("torch.compile", side_effect=lambda fn: fn),
             ):

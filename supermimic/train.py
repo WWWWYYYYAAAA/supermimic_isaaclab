@@ -31,6 +31,7 @@ def main(argv=None, *, env_cfg=None):
         log_dir=env_cfg.log_dir,
         num_envs=env_cfg.scene.num_envs,
         goal_frames=env_cfg.commands.motion.goal_frames,
+        anchor_obs=env_cfg.commands.motion.anchor_obs,
         hist=env_cfg.policy_observation.history,
     )
     args = parser.parse_args(argv)
@@ -38,6 +39,7 @@ def main(argv=None, *, env_cfg=None):
     env_cfg.sim.device = args.device
     env_cfg.policy_observation.history = args.hist
     env_cfg.commands.motion.goal_frames = args.goal_frames
+    env_cfg.commands.motion.anchor_obs = args.anchor_obs
     env_cfg.prepare()
     from supermimic.training.run_directory import create_run_directory
 

@@ -38,6 +38,7 @@ def task_settings(cfg):
         "self_collisions": cfg.self_collisions,
         "episode_length_s": cfg.episode_length_s,
         "goal_frames": cfg.commands.motion.goal_frames,
+        "anchor_obs": cfg.commands.motion.anchor_obs,
     }
 
 
@@ -87,6 +88,7 @@ def apply_task_settings(cfg, saved):
     cfg.self_collisions = saved["self_collisions"]
     cfg.episode_length_s = saved["episode_length_s"]
     cfg.commands.motion.goal_frames = saved["goal_frames"]
+    cfg.commands.motion.anchor_obs = saved.get("anchor_obs", False)
     return cfg.prepare()
 
 
@@ -114,6 +116,7 @@ def same_settings(left, right):
     def canonical(value):
         value = deepcopy(value)
         if isinstance(value, dict) and "control" in value:
+            value.setdefault("anchor_obs", False)
             # Older policy-only evaluation snapshots did not describe these groups.
             for name in ("critic_observations", "world_model_observations"):
                 value.setdefault(name, asdict(StateObservationCfg()))

@@ -4,15 +4,63 @@ from __future__ import annotations
 
 import glob
 import os
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from .kinematics import G1Kinematics
+if TYPE_CHECKING:
+    from .kinematics import G1Kinematics
 from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+GOAL_FRAME_DIM = 68
+LEGACY_GOAL_FRAME_DIM = 73
+ANCHOR_OBS_DIM = 9
+GOAL_REFERENCE_ORIENTATION_DIM = 6
+
+
+def motion_goal_dim(goal_frames: int, anchor_obs: bool = True) -> int:
+    """Current-frame-inclusive reference window, optionally followed by anchor pose."""
+    return GOAL_FRAME_DIM * goal_frames + (ANCHOR_OBS_DIM if anchor_obs else 0)
+
+
+def update_orientation_history(history, current, history_length, reset_mask=None):
+    """Oldest-to-newest actual orientation samples; pad resets with the first sample."""
+    initial = current.unsqueeze(1).expand(-1, history_length, -1)
+    if history is None:
+        return initial.clone()
+    updated = torch.cat((history[:, 1:], current.unsqueeze(1)), dim=1)
+    return updated if reset_mask is None else torch.where(reset_mask[:, None, None], initial, updated)
+
+
+def checkpoint_goal_dim(checkpoint: dict) -> int:
+    """Recognize reference-only, single-orientation and orientation-history policies."""
+    frames = checkpoint["args"]["goal_frames"]
+    history = checkpoint["args"]["hist"]
+    weight = checkpoint["pi"].get("enc.0.weight")
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        raise ValueError("Checkpoint is missing a valid motion encoder input weight")
+    width = weight.shape[1]
+    version = checkpoint.get("model_input_version", 0)
+    if version >= 7:
+        expected = motion_goal_dim(frames, checkpoint["args"].get("anchor_obs", True))
+        if version != 7 or width != expected:
+            raise ValueError("Checkpoint input version/anchor_obs disagrees with motion goal width")
+        return width
+    reference_dim = LEGACY_GOAL_FRAME_DIM * frames
+    legacy_history_dim = reference_dim + GOAL_REFERENCE_ORIENTATION_DIM * history
+    if width not in (reference_dim, reference_dim + 6, legacy_history_dim):
+        raise ValueError("Checkpoint goal width disagrees with args.goal_frames")
+    version = checkpoint.get("model_input_version", 0)
+    if version >= 6 and width != reference_dim:
+        raise ValueError("Checkpoint input version requires reference-only motion_goal")
+    if version == 5 and width != legacy_history_dim:
+        raise ValueError("Checkpoint input version requires reference orientation history in motion_goal")
+    if version == 4 and width != reference_dim + 6:
+        raise ValueError("Checkpoint input version requires current reference orientation in motion_goal")
+    return width
 
 
 class MotionLib:
@@ -20,6 +68,8 @@ class MotionLib:
         self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0
     ):
         self.device = device
+        from .robot_spec import default_joint_pos_list
+        self.default_q = torch.tensor(default_joint_pos_list(), device=device)
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
         lens = []
@@ -136,14 +186,33 @@ class MotionLib:
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
         return MotionLib(files, kin, device)
 
+    def tracking_end(self, K: int) -> torch.Tensor:
+        """Terminal current frame: its inclusive K-frame goal reaches the clip end."""
+        return self.clip_end - (K - 1)
+
+    def validate_goal_window(self, K: int) -> None:
+        if K < 1:
+            raise ValueError("goal_frames must be positive")
+        if bool((self.tracking_end(K) <= self.clip_start).any()):
+            raise ValueError("Each motion clip must have more than goal_frames frames to allow a tracking step")
+
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
         """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""
         end = self.clip_end[self.clip_id[f]]
         fut = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
         return torch.minimum(fut, end.unsqueeze(-1))
 
-    def goal(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """K future reference frames, holding the final pose with zero velocity beyond the clip."""
+    def legacy_goal(
+        self, f: torch.Tensor, K: int, robot_rotation: torch.Tensor | None = None,
+        *, reference_orientation_history: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Future reference sequence; optional orientation tails are legacy-only.
+
+        History has shape [B,H,6], oldest to newest, with each sample computed
+        from that time's robot and reference. robot_rotation is legacy single-frame mode.
+        """
+        if robot_rotation is not None and reference_orientation_history is not None:
+            raise ValueError("Supply orientation history or legacy current rotation, not both")
         fut = self.future_frames(f, K)  # (B,K)
         requested = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
         recorded = (
@@ -161,7 +230,44 @@ class MotionLib:
         ).squeeze(-1)
         rot = mat_to_6d(Ht @ self.root_R[fut])
         feats = torch.cat((dp, rot, v, w, self.q[fut], qd * 0.1), -1)  # (B,K,73)
-        return feats.reshape(f.shape[0], -1)
+        future = feats.reshape(f.shape[0], -1)
+        if reference_orientation_history is not None:
+            if (reference_orientation_history.ndim != 3
+                or reference_orientation_history.shape[0] != f.shape[0]
+                or reference_orientation_history.shape[1] < 1
+                or reference_orientation_history.shape[2] != 6):
+                raise ValueError("reference_orientation_history must have shape [batch, history, 6]")
+            return torch.cat((future, reference_orientation_history.flatten(1)), dim=-1)
+        if robot_rotation is None:
+            return future
+        relative = mat_to_6d(robot_rotation.transpose(-1, -2) @ self.root_R[f])
+        return torch.cat((future, relative), dim=-1)
+
+    def goal(self, f: torch.Tensor, K: int) -> torch.Tensor:
+        """68D reference features at f..f+K-1; repeat the complete last frame.
+
+        q-q0(29), qd(29), gravity_body(3), omega_body(3),
+        velocity_heading(3), root_height(1). No velocity scaling/zero padding.
+        Anchor observations depend on the robot and are appended by MDP.goal().
+        """
+        end = self.clip_end[self.clip_id[f]]
+        idx = torch.minimum(f[..., None] + torch.arange(K, device=f.device), end[..., None])
+        R = self.root_R[idx]
+        Ht = yaw_mat(R).transpose(-1, -2)
+        features = torch.cat((self.q[idx]-self.default_q, self.qd[idx], -R[..., 2, :],
+            (R.transpose(-1,-2) @ self.root_w[idx].unsqueeze(-1)).squeeze(-1),
+            (Ht @ self.root_v[idx].unsqueeze(-1)).squeeze(-1), self.root_p[idx][..., 2:3]), -1)
+        return features.flatten(-2)
+
+    def policy_goal(self, f, K, robot_rotation, orientation_history, goal_dim):
+        """Historical v2-v6 goal adapter. New policies use MDP.goal()."""
+        if goal_dim == LEGACY_GOAL_FRAME_DIM * K:
+            return self.legacy_goal(f, K)
+        if orientation_history is not None and goal_dim == LEGACY_GOAL_FRAME_DIM*K+6*orientation_history.shape[1]:
+            return self.legacy_goal(f, K, reference_orientation_history=orientation_history)
+        if goal_dim == LEGACY_GOAL_FRAME_DIM*K+6:
+            return self.legacy_goal(f, K, robot_rotation)
+        raise ValueError("Legacy policy goal width does not match reference/history lengths")
 
     def ref_state(self, f: torch.Tensor):
         return (

@@ -12,8 +12,8 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from supermimic import networks
-from supermimic.mdp import MDP
-from supermimic.motion import MotionLib
+from supermimic.mdp import MDP, flatten_state
+from supermimic.motion import MotionLib, checkpoint_goal_dim, motion_goal_dim, update_orientation_history
 from supermimic.kinematics import G1Kinematics
 from supermimic.networks import Policy
 from supermimic.robot_spec import default_joint_pos_list
@@ -61,18 +61,27 @@ class Evaluator:
         a_ = ck["args"]
         (K, Hh) = (a_["goal_frames"], a_["hist"])
         networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-        pi = Policy(self.mdp.obs_dim, 73 * K, hist=Hh).to(self.dev)
+        goal_dim = checkpoint_goal_dim(ck)
+        self.mdp.legacy_inputs = ck.get("model_input_version", 0) < 7
+        pi = networks.policy_from_checkpoint(ck, self.mdp.obs_dim).to(self.dev)
         pi.load_state_dict(ck["pi"])
         pi.eval()
+        self.motion.validate_goal_window(K)
+        env.reference.cfg.goal_frames = K
         ids = torch.arange(self.C, device=self.dev)
         env.done_eval[:] = False
         env.failed_eval[:] = False
         env.reset(ids, self.motion.clip_start.clone())
-        clip_end = self.motion.clip_end.clone()
+        clip_end = self.motion.tracking_end(K)
+        tracking_steps = clip_end - self.motion.clip_start
         ret = torch.zeros(self.C, device=self.dev)
         steps = torch.zeros(self.C, device=self.dev)
         hist = None
-        traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
+        orientation_history = None
+        traj = {name: [] for name in (
+            "root_p", "root_quat", "q", "f", "alive",
+            "obs_history", "motion_goal", "action", "state", "xi",
+        )}
         while not bool(env.done_eval.all()):
             S = env.state()
             o = self.mdp.obs(S, env.a_prev, env.xi, env.f)
@@ -81,11 +90,22 @@ class Evaluator:
                 if hist is None
                 else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
             )
-            a = pi(hist.flatten(-2), self.motion.goal(env.f, K))
+            if self.mdp.legacy_inputs and goal_dim > 73*K:
+                orientation_history = update_orientation_history(
+                    orientation_history, self.mdp.reference_orientation(S, env.f), Hh
+                )
+            goal = (self.motion.policy_goal(env.f, K, S[1], orientation_history, goal_dim)
+                    if self.mdp.legacy_inputs else self.mdp.goal(S, env.f, K, a_.get("anchor_obs", True)))
+            a = pi(self.mdp.flatten_history(hist), goal)
             alive = ~env.done_eval.clone()
             if record:
                 from supermimic.rotations import mat_to_quat
 
+                traj["obs_history"].append(self.mdp.flatten_history(hist).cpu().clone())
+                traj["motion_goal"].append(goal.cpu().clone())
+                traj["action"].append(a.cpu().clone())
+                traj["state"].append(flatten_state(S).cpu())
+                traj["xi"].append(env.xi.cpu().clone())
                 (
                     traj["root_p"].append(S[0].cpu()),
                     traj["root_quat"].append(mat_to_quat(S[1]).cpu()),
@@ -99,12 +119,14 @@ class Evaluator:
             ret += torch.where(alive, out["r"], 0.0)
             steps += alive.float()
             env.f = torch.minimum(env.f, clip_end - 1)
-        norm = ret / ((self.motion.clip_len - 1).float() * self.mdp.max_step_reward)
+        norm = ret / (tracking_steps.float() * self.mdp.max_step_reward)
         res = {
+            "goal_frames": K,
+            "clip_end_rule": "current_frame + goal_frames - 1 >= last_reference_frame",
             "norm_return": norm.mean().item(),
             "norm_return_framew": (
                 ret.sum()
-                / ((self.motion.clip_len - 1).sum() * self.mdp.max_step_reward)
+                / (tracking_steps.sum() * self.mdp.max_step_reward)
             ).item(),
             "n_failed": int(env.failed_eval.sum().item()),
             "failed": [
